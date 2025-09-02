@@ -95,3 +95,99 @@
   )
   (not (is-eq party-a party-b))
 )
+
+(define-private (serialize-balance-commitment
+    (channel-id (buff 32))
+    (balance-a uint)
+    (balance-b uint)
+  )
+  (concat (concat channel-id (unwrap-panic (to-consensus-buff? balance-a)))
+    (unwrap-panic (to-consensus-buff? balance-b))
+  )
+)
+;; CHANNEL LIFECYCLE MANAGEMENT
+
+(define-public (establish-channel
+    (channel-id (buff 32))
+    (counterparty principal)
+    (initial-funding uint)
+  )
+  (let ((channel-key {
+      channel-id: channel-id,
+      party-a: tx-sender,
+      party-b: counterparty,
+    }))
+    ;; VALIDATION PHASE
+    (asserts! (validate-channel-id channel-id) ERR_INVALID_PARAMETERS)
+    (asserts! (validate-deposit-amount initial-funding) ERR_INVALID_PARAMETERS)
+    (asserts! (validate-parties tx-sender counterparty) ERR_SELF_TRANSACTION)
+    (asserts! (is-none (map-get? payment-channels channel-key))
+      ERR_CHANNEL_EXISTS
+    )
+
+    ;; FUNDING PHASE
+    ;; Lock STX in contract escrow (equivalent to Bitcoin multisig)
+    (try! (stx-transfer? initial-funding tx-sender (as-contract tx-sender)))
+
+    ;; STATE INITIALIZATION
+    (map-set payment-channels channel-key {
+      total-value: initial-funding,
+      balance-a: initial-funding,
+      balance-b: u0,
+      channel-state: u1, ;; Open state
+      dispute-expiry: u0, ;; No active dispute
+      sequence-number: u0, ;; Initial nonce
+      creation-height: stacks-block-height,
+    })
+
+    ;; Initialize channel metrics
+    (map-set channel-metrics { channel-id: channel-id } {
+      total-transactions: u0,
+      lifetime-volume: initial-funding,
+      last-activity: stacks-block-height,
+    })
+
+    (ok {
+      status: "channel-established",
+      funding: initial-funding,
+    })
+  )
+)
+
+(define-public (fund-existing-channel
+    (channel-id (buff 32))
+    (counterparty principal)
+    (additional-funding uint)
+  )
+  (let (
+      (channel-key {
+        channel-id: channel-id,
+        party-a: tx-sender,
+        party-b: counterparty,
+      })
+      (channel-data (unwrap! (map-get? payment-channels channel-key) ERR_CHANNEL_NOT_FOUND))
+    )
+    ;; VALIDATION PHASE
+    (asserts! (validate-deposit-amount additional-funding) ERR_INVALID_PARAMETERS)
+    (asserts! (is-eq (get channel-state channel-data) u1) ERR_CHANNEL_CLOSED)
+
+    ;; FUNDING PHASE
+    (try! (stx-transfer? additional-funding tx-sender (as-contract tx-sender)))
+
+    ;; STATE UPDATE
+    (map-set payment-channels channel-key
+      (merge channel-data {
+        total-value: (+ (get total-value channel-data) additional-funding),
+        balance-a: (+ (get balance-a channel-data) additional-funding),
+      })
+    )
+
+    ;; Update metrics
+    (match (map-get? channel-metrics { channel-id: channel-id })
+      metrics
+      (map-set channel-metrics { channel-id: channel-id }
+        (merge metrics {
+          lifetime-volume: (+ (get lifetime-volume metrics) additional-funding),
+          last-activity: stacks-block-height,
+        })
+      )
