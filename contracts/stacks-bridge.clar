@@ -191,3 +191,93 @@
           last-activity: stacks-block-height,
         })
       )
+      ;; Initialize if not exists
+      (map-set channel-metrics { channel-id: channel-id } {
+        total-transactions: u0,
+        lifetime-volume: additional-funding,
+        last-activity: stacks-block-height,
+      })
+    )
+
+    (ok {
+      status: "channel-funded",
+      additional-funding: additional-funding,
+    })
+  )
+)
+
+;; COOPERATIVE CLOSURE SYSTEM
+
+(define-private (verify-dual-signature
+    (message (buff 256))
+    (signature-a (buff 65))
+    (signature-b (buff 65))
+    (party-a principal)
+    (party-b principal)
+  )
+  ;; Note: In production, this would use actual cryptographic verification
+  (and
+    (is-eq tx-sender party-a)
+    (validate-signature-format signature-a)
+    (validate-signature-format signature-b)
+  )
+)
+
+(define-public (close-channel-cooperatively
+    (channel-id (buff 32))
+    (counterparty principal)
+    (final-balance-a uint)
+    (final-balance-b uint)
+    (signature-a (buff 65))
+    (signature-b (buff 65))
+  )
+  (let (
+      (channel-key {
+        channel-id: channel-id,
+        party-a: tx-sender,
+        party-b: counterparty,
+      })
+      (channel-data (unwrap! (map-get? payment-channels channel-key) ERR_CHANNEL_NOT_FOUND))
+      (settlement-message (serialize-balance-commitment channel-id final-balance-a final-balance-b))
+    )
+    ;; VALIDATION PHASE
+    (asserts! (is-eq (get channel-state channel-data) u1) ERR_CHANNEL_CLOSED)
+    (asserts!
+      (is-eq (+ final-balance-a final-balance-b) (get total-value channel-data))
+      ERR_BALANCE_MISMATCH
+    )
+    (asserts!
+      (verify-dual-signature settlement-message signature-a signature-b tx-sender
+        counterparty
+      )
+      ERR_INVALID_SIGNATURE
+    )
+
+    ;; SETTLEMENT PHASE
+    ;; Execute atomic settlement to both parties
+    (if (> final-balance-a u0)
+      (try! (as-contract (stx-transfer? final-balance-a tx-sender tx-sender)))
+      true
+    )
+    (if (> final-balance-b u0)
+      (try! (as-contract (stx-transfer? final-balance-b tx-sender counterparty)))
+      true
+    )
+
+    ;; FINALIZATION
+    (map-set payment-channels channel-key
+      (merge channel-data {
+        channel-state: u0, ;; Closed state
+        balance-a: u0,
+        balance-b: u0,
+        total-value: u0,
+      })
+    )
+
+    (ok {
+      status: "channel-closed-cooperatively",
+      final-balance-a: final-balance-a,
+      final-balance-b: final-balance-b,
+    })
+  )
+)
