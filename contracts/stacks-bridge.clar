@@ -281,3 +281,105 @@
     })
   )
 )
+
+;; DISPUTE RESOLUTION & PENALTY SYSTEM
+
+(define-public (initiate-dispute-closure
+    (channel-id (buff 32))
+    (counterparty principal)
+    (claimed-balance-a uint)
+    (claimed-balance-b uint)
+    (state-signature (buff 65))
+  )
+  (let (
+      (channel-key {
+        channel-id: channel-id,
+        party-a: tx-sender,
+        party-b: counterparty,
+      })
+      (channel-data (unwrap! (map-get? payment-channels channel-key) ERR_CHANNEL_NOT_FOUND))
+      (commitment-message (serialize-balance-commitment channel-id claimed-balance-a
+        claimed-balance-b
+      ))
+    )
+    ;; VALIDATION PHASE
+    (asserts! (is-eq (get channel-state channel-data) u1) ERR_CHANNEL_CLOSED)
+    (asserts!
+      (is-eq (+ claimed-balance-a claimed-balance-b)
+        (get total-value channel-data)
+      )
+      ERR_BALANCE_MISMATCH
+    )
+    ;; Note: In production, verify signature against the claiming party
+    (asserts! (validate-signature-format state-signature) ERR_INVALID_SIGNATURE)
+
+    ;; DISPUTE INITIATION
+    (map-set payment-channels channel-key
+      (merge channel-data {
+        channel-state: u2, ;; Dispute state
+        balance-a: claimed-balance-a,
+        balance-b: claimed-balance-b,
+        dispute-expiry: (+ stacks-block-height DISPUTE_RESOLUTION_BLOCKS),
+      })
+    )
+
+    (ok {
+      status: "dispute-initiated",
+      dispute-expiry: (+ stacks-block-height DISPUTE_RESOLUTION_BLOCKS),
+      claimed-balance-a: claimed-balance-a,
+      claimed-balance-b: claimed-balance-b,
+    })
+  )
+)
+
+(define-public (finalize-disputed-closure
+    (channel-id (buff 32))
+    (counterparty principal)
+  )
+  (let (
+      (channel-key {
+        channel-id: channel-id,
+        party-a: tx-sender,
+        party-b: counterparty,
+      })
+      (channel-data (unwrap! (map-get? payment-channels channel-key) ERR_CHANNEL_NOT_FOUND))
+    )
+    ;; VALIDATION PHASE
+    (asserts! (is-eq (get channel-state channel-data) u2) ERR_DISPUTE_ACTIVE)
+    (asserts! (>= stacks-block-height (get dispute-expiry channel-data))
+      ERR_DISPUTE_ACTIVE
+    )
+
+    ;; SETTLEMENT EXECUTION
+    (let (
+        (final-balance-a (get balance-a channel-data))
+        (final-balance-b (get balance-b channel-data))
+      )
+      ;; Execute settlement
+      (if (> final-balance-a u0)
+        (try! (as-contract (stx-transfer? final-balance-a tx-sender tx-sender)))
+        true
+      )
+      (if (> final-balance-b u0)
+        (try! (as-contract (stx-transfer? final-balance-b tx-sender counterparty)))
+        true
+      )
+
+      ;; Close channel
+      (map-set payment-channels channel-key
+        (merge channel-data {
+          channel-state: u0, ;; Closed state
+          balance-a: u0,
+          balance-b: u0,
+          total-value: u0,
+        })
+      )
+
+      (ok {
+        status: "dispute-resolved",
+        final-balance-a: final-balance-a,
+        final-balance-b: final-balance-b,
+      })
+    )
+  )
+)
